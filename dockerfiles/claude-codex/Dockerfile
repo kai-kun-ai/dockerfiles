@@ -73,7 +73,8 @@ COPY --from=go_builder /usr/local/go /usr/local/go
 
 ADD ./exec_user.sh /usr/local/bin/exec_user.sh
 ADD ./setup_skills.sh /usr/local/bin/setup_skills.sh
-RUN chmod +x /usr/local/bin/exec_user.sh /usr/local/bin/setup_skills.sh
+ADD ./ai-audit.py /usr/local/bin/ai-audit
+RUN chmod +x /usr/local/bin/exec_user.sh /usr/local/bin/setup_skills.sh /usr/local/bin/ai-audit
 
 ENTRYPOINT ["/usr/local/bin/exec_user.sh"]
 CMD ["/bin/bash"]

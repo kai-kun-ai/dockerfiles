@@ -45,5 +45,8 @@ dockerfiles
 		* Claude Code → Codex 連携 (`openai/codex-plugin-cc`)
 		* Codex → Claude Code 連携 (`sendbird/cc-plugin-codex`)
 		* 公式のコードセキュリティ plugin (`security-guidance@claude-plugins-official`)
+	* `ai-audit` コマンドで、エージェントの活動 (実行コマンド・ファイル操作) を
+	  セッションログから集計し、テキスト要約と HTML レポートを生成できます
 * 詳細・無効化方法は [標準skills (plugins)](./claude-codex/skills.md) を参照
+* 監査レポートについては [監査レポート (ai-audit)](./claude-codex/audit.md) を参照
 
