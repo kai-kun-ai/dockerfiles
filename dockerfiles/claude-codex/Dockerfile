@@ -74,7 +74,32 @@ COPY --from=go_builder /usr/local/go /usr/local/go
 ADD ./exec_user.sh /usr/local/bin/exec_user.sh
 ADD ./setup_skills.sh /usr/local/bin/setup_skills.sh
 ADD ./ai-audit.py /usr/local/bin/ai-audit
+ADD ./snoopy.ini /etc/snoopy.ini
 RUN chmod +x /usr/local/bin/exec_user.sh /usr/local/bin/setup_skills.sh /usr/local/bin/ai-audit
+
+# OS-level exec auditing (issue #280): record every execve via snoopy, a mature
+# LD_PRELOAD command logger enabled image-wide through /etc/ld.so.preload. It
+# needs no privileges, so it works in the unprivileged make target=claude/codex
+# sandbox (unlike auditd/eBPF/process-accounting, whose kernel subsystems are
+# not namespaced). The log feeds `ai-audit`.
+#
+# The self-test below exercises the preload, the log format and the ai-audit
+# parser end-to-end and fails the build if any break -- important because CI
+# builds this image but does not run it (the run-smoke step is skipped for
+# claude-codex), so a runtime-only regression would otherwise pass unnoticed.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends snoopy && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /var/log/ai-audit && chmod 1777 /var/log/ai-audit && \
+    snoopy_lib="$(dpkg -L snoopy | grep -E '/libsnoopy\.so$' | head -n1)" && \
+    test -n "${snoopy_lib}" && echo "${snoopy_lib}" > /etc/ld.so.preload && \
+    /bin/echo snoopy-selftest-marker >/dev/null && \
+    grep -q '^snoopy-audit|' /var/log/ai-audit/exec.log && \
+    grep -q 'snoopy-selftest-marker' /var/log/ai-audit/exec.log && \
+    python3 /usr/local/bin/ai-audit --agent exec \
+        --exec-log /var/log/ai-audit/exec.log --json \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["by_agent"].get("exec",0) >= 1, d' && \
+    : > /var/log/ai-audit/exec.log
 
 ENTRYPOINT ["/usr/local/bin/exec_user.sh"]
 CMD ["/bin/bash"]

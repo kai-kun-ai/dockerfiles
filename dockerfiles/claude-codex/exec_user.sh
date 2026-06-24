@@ -29,6 +29,29 @@ function update_startup_tools() {
 		bash /usr/local/bin/setup_skills.sh || true
 }
 
+function setup_exec_audit() {
+	# OS-level exec auditing via snoopy (issue #280). snoopy is enabled
+	# image-wide through /etc/ld.so.preload, so it records every execve() that
+	# happens in the container regardless of what the agents log themselves.
+	# Here we only prepare the (host-mounted) log location and honour an opt-out.
+	case "${EXEC_AUDIT:-1}" in
+		0|no|NO|false|FALSE|off|OFF)
+			# Disable snoopy for this container run by emptying the preload list.
+			: > /etc/ld.so.preload 2>/dev/null || true
+			echo "[audit] EXEC_AUDIT disabled: snoopy exec auditing is off for this run."
+			return 0
+			;;
+	esac
+	# /var/log/ai-audit is bind-mounted from the host (~/.shared_cache.ai-audit)
+	# when launched via the Makefile, so the log survives the --rm container.
+	mkdir -p /var/log/ai-audit 2>/dev/null || true
+	touch /var/log/ai-audit/exec.log 2>/dev/null || true
+	# Both the work user and root (via sudo) must be able to append so the
+	# OS-level record stays complete in this single-user container.
+	chmod 0666 /var/log/ai-audit/exec.log 2>/dev/null || true
+	echo "[audit] snoopy exec auditing on -> /var/log/ai-audit/exec.log (EXEC_AUDIT=0 to disable; run 'ai-audit' for a report)."
+}
+
 function exec_usershell() {
 	cd "${WORK_DIR}"
 	exec sudo -H -u "${LOCAL_WHOAMI}" env \
@@ -95,6 +118,7 @@ test -n "${SSH_AUTH_SOCK:-}" && chown ${LOCAL_WHOAMI}:${LOCAL_WHOAMI} "${SSH_AUT
 test -d /home/${LOCAL_WHOAMI}/.host.ssh && test ! -e /home/${LOCAL_WHOAMI}/.ssh && ln -s /home/${LOCAL_WHOAMI}/.host.ssh /home/${LOCAL_WHOAMI}/.ssh
 
 chown -R ${LOCAL_WHOAMI}:${LOCAL_WHOAMI} /home/${LOCAL_WHOAMI} || :
+setup_exec_audit
 update_startup_tools
 
 notice_codex_setup "$@"

@@ -1,85 +1,118 @@
-claude-codex 監査レポート (ai-audit)
+claude-codex 監査 (exec auditing + ai-audit レポート)
 ===
 
 `make target=claude` / `make target=codex` で起動する `claude-codex` イメージに、
-**エージェント (Claude Code / OpenAI Codex) の活動を監査するレポート機能** を入れています。
-[issue #280](https://github.com/hinoshiba/dockerfiles/issues/280) の「audit系を追加する」
-への対応です。
+**エージェント (Claude Code / OpenAI Codex) が行った作業を OS レベルで記録し、
+グラフィカルなレポートにする** 仕組みを入れています。
+[issue #280](https://github.com/hinoshiba/dockerfiles/issues/280) への対応です。
 
-## なぜ auditd を中で動かさないのか (調査結果)
+構成は2層です。
 
-issue の元案は「`auditd` を結構強気で動かす」でしたが、**コンテナの中で `auditd` を
-回すのは枯れた方式ではありません**。理由:
+1. **取得層 (snoopy)** — コンテナ内で実行された全コマンド (`execve`) を記録する。
+2. **レポート層 (`ai-audit`)** — 取得したログ + エージェントのセッションログを集計し、
+   テキスト要約と HTML レポートを出力する。
 
-* Linux カーネルの audit subsystem は **namespace 化されていません**。
-  コンテナ内の `auditd` は `CAP_AUDIT_CONTROL` / `CAP_AUDIT_READ` と、
-  ホストと共有される audit netlink socket を要求します。
-* そのため、非特権コンテナ (通常の `make target=claude` / `make target=codex` の起動) では
-  そもそも起動に失敗するか、起動できてもホスト全体の audit イベントを巻き込みます。
-  これは可搬性・安全性ともに不適切です。
-* `auditd` を回すために `--privileged` 相当の権限を渡すのは、AI エージェントを
-  閉じ込めるという本来の目的と真逆になります。
+## 調査: コンテナ内で「真の syscall 監査」はできない
 
-## 採用した枯れた方式: エージェント自身のセッションログを使う
+issue の元案は「`auditd` を結構強気で動かす」でした。しかし**非特権コンテナの中で
+カーネルレベルの syscall 監査を回すのは原理的にできません**。
 
-特権を一切必要とせず、しかも **既に存在する** 高忠実度の監査証跡があります。
-Claude Code と Codex は、エージェントが実行した **全コマンド** と **触れたファイル** を、
-タイムスタンプ付きの行区切り JSON (JSONL) として永続化しています。
+- `auditd`（カーネル audit）/ `eBPF`(Falco・execsnoop 等) / プロセスアカウンティング
+  (`accton`) は、いずれもカーネルのサブシステムが **namespace 化されておらず**、
+  `CAP_AUDIT_CONTROL` / `CAP_BPF` / `CAP_SYS_PACCT`（実質 `--privileged`）を要求します。
+- 通常の `make target=claude` / `make target=codex`（エージェントを閉じ込めるための
+  非特権サンドボックス）では `EPERM` で起動できないか、できてもホスト全体を巻き込みます。
+- 監査のためにサンドボックスの特権を上げるのは本末転倒です。
 
-| エージェント | ログの場所 |
-| --- | --- |
-| OpenAI Codex | `~/.codex/sessions/**/*.jsonl` (既に `codex-monitor` が解析しているもの) |
-| Claude Code | `~/.claude/projects/**/*.jsonl` |
+→ 真の syscall レベルが要るなら、コンテナ内ではなく**ホスト側**で `auditd`/`Falco` を
+コンテナの cgroup に絞って回すのが筋です（後述「限界」）。その手前で、**特権なし・
+コンテナ内で完結・枯れている**現実解が snoopy です。
 
-これらは host からマウントされるため **コンテナを破棄しても残り**、
-取得に権限が要らず、エージェントの実際の操作そのものを記録しています。
-`ai-audit` はこのログを読み、
+## 採用した枯れた方式: snoopy による exec 監査
 
-* ターミナル向けの **テキスト要約**、および
-* 依存ゼロで自己完結した **HTML レポート** (issue の言う「グラフィカルにわかりやすい」)
+[snoopy](https://github.com/a2o/snoopy) は約20年の実績がある `LD_PRELOAD` 型の
+コマンドロガーです。`/etc/ld.so.preload` でイメージ全体に有効化され、コンテナ内で
+起きた **全 `execve()`** を、エージェントの自己申告とは独立に記録します。特権は不要で、
+syslog デーモンが無いコンテナでも**ファイルに直接**書けます。
 
-を生成します。HTML は **JavaScript も CDN も使わず**、CSS だけで棒グラフ・タイムラインを
-描くので、オフラインでそのまま開けて将来も壊れません。実装は Python 標準ライブラリのみで、
-新たに入れるパッケージはありません。
+記録されるのは「実際に実行されたコマンド」です。1 行 1 exec で、`ai-audit` が
+パースできるパイプ区切り形式 ([`snoopy.ini`](../../dockerfiles/claude-codex/snoopy.ini)):
 
-## 使い方
+```
+snoopy-audit|<unix時刻>|<uid>|<ユーザ名>|<cwd>|<コマンドライン>
+```
+
+コマンドラインは最後に置いてあるので、中に `|` が含まれても安全にパースできます。
+
+### ログの場所と永続化
+
+- コンテナ内のパス: `/var/log/ai-audit/exec.log`
+- `make target=claude/codex` で起動すると、Makefile がホストの
+  `~/.shared_cache.ai-audit` をここに bind mount します。コンテナは `--rm` で
+  破棄されますが、**ログはホスト側に残ります**（`~/.shared_cache.ai-audit/exec.log`）。
+
+### 無効化
 
 ```sh
-ai-audit                  # テキスト要約 + HTML レポート (~/.ai-audit/ai-audit-report.html)
-ai-audit --agent codex    # Codex のセッションのみ
-ai-audit --agent claude   # Claude Code のセッションのみ
-ai-audit --since 7d       # 直近 7 日 (30m / 24h / 7d / 2w …) のイベントのみ
-ai-audit --top 30         # コマンド頻度チャートの上位件数
-ai-audit --html report.html   # HTML の出力先を指定
-ai-audit --text-only      # HTML を出さずテキスト要約だけ
-ai-audit --json           # 機械可読な JSON 要約
+EXEC_AUDIT=0 make target=claude   # このコンテナ起動だけ snoopy を無効化
+```
+
+(エントリポイントが `/etc/ld.so.preload` を空にして無効化します。)
+
+## レポート層: ai-audit
+
+[`ai-audit`](../../dockerfiles/claude-codex/ai-audit.py)（Python 標準ライブラリのみ、
+新規パッケージなし）は、snoopy の exec ログと、エージェントが永続化している
+セッションログを **統合** して集計します。
+
+| ソース | 場所 | 性質 |
+| --- | --- | --- |
+| exec (snoopy) | `/var/log/ai-audit/exec.log` | OS レベル・エージェント非依存の実行記録 |
+| Codex | `~/.codex/sessions/**/*.jsonl` | どのエージェントか・ファイル編集等の構造化情報 (`codex-monitor` も利用) |
+| Claude Code | `~/.claude/projects/**/*.jsonl` | 同上 |
+
+snoopy が「独立した実行の地の文」を、セッションログが「構造 (エージェント種別・
+ファイル操作・セッション単位)」を補い合います。
+
+```sh
+ai-audit                  # テキスト要約 + HTML (~/.ai-audit/ai-audit-report.html)
+ai-audit --agent exec     # snoopy の exec ログだけ
+ai-audit --agent codex    # Codex のセッションだけ
+ai-audit --since 7d       # 直近 7 日 (30m/24h/7d/2w)
+ai-audit --exec-log PATH  # exec ログのパスを指定 (既定: /var/log/ai-audit/exec.log)
+ai-audit --html ./a.html  # HTML 出力先を指定
+ai-audit --json           # 機械可読サマリ
 ai-audit --help
 ```
 
-引数なしの `ai-audit` は、テキスト要約を表示しつつ
-`~/.ai-audit/ai-audit-report.html` に HTML レポートを書き出してパスを表示します。
-ブラウザ等で開けるよう、HTML はカレントの作業ディレクトリ配下に出力してもよいでしょう
-(`ai-audit --html ./audit.html`)。
+HTML レポート (JavaScript も CDN も使わず CSS だけで描画。オフラインで開ける) の内容:
 
-### レポートの内容
+- 概要カード: 総アクション数 / セッション数 / コマンド数 / ファイル書き込み・読み取り数
+- ソース別 (exec / codex / claude) の内訳
+- **コマンド頻度** (argv0 でまとめた棒グラフ)
+- **アクティビティのタイムライン** (1時間単位のヒストグラム)
+- セッション一覧、アクションログ (直近 500 件)
 
-* 概要カード: 総アクション数 / セッション数 / コマンド数 / ファイル書き込み・読み取り数
-* エージェント別 (codex / claude) の内訳
-* **コマンド頻度** (argv0 でまとめた棒グラフ)
-* **アクティビティのタイムライン** (1時間単位のヒストグラム)
-* セッション一覧 (アクション数・時間範囲)
-* アクションログ (時刻・エージェント・種別・内容。直近 500 件まで)
+## ビルド時セルフテスト (なぜ必要か)
 
-## 設計上の性質
+CI は `claude-codex` を **ビルドのみ** で検証し、実行スモークはスキップします。
+そのため `/etc/ld.so.preload` 経由の snoopy が実際に動くか・ログ形式が `ai-audit` で
+パースできるかは、放っておくと CI で検出できません。
 
-* **best-effort**: 壊れた行・想定外の行は読み飛ばし、活動が無ければ「無い」と表示して
-  正常終了します。コンテナ起動を妨げません。
-* **読み取り専用**: ログを解析するだけで、エージェントの挙動やコンテナ起動フローを
-  変えません。自動では走らず、必要なときに手で実行します。
-* **テレメトリ無し / 完全オフライン**: 外部送信は一切ありません。
+これを潰すため、[Dockerfile](../../dockerfiles/claude-codex/Dockerfile) のビルド内に
+セルフテストを埋め込んでいます。snoopy を有効化した直後に既知のコマンドを実行し、
+(1) exec ログにその行が記録されること、(2) 行が想定フォーマットであること、
+(3) `ai-audit` がそれを exec イベントとして集計できること、を確認し、いずれか
+壊れていればビルドを失敗させます。**CI ビルドが通ること = end-to-end で動くこと**に
+なります。
 
-> 補足: セッションログはエージェント自身が書くため、OS レベルの強制的な監査
-> (例: 改ざん耐性のあるカーネル audit) ではありません。一方で「エージェントが
-> 何をしたかを後から人間がレビューする」という目的には、特権不要で最も忠実かつ
-> 枯れた情報源です。より強い OS レベル監査が必要なら、コンテナ内ではなく
-> **ホスト側**で `auditd` を回す (コンテナのプロセスをホストから監査する) のが筋です。
+## 限界
+
+- **exec 単位であって全 syscall ではありません。** ファイル read/write やネットワーク
+  といった個々の syscall までは追いません（それは特権が要るカーネル audit の領域）。
+  「何のコマンドを実行したか」は完全に取れます。
+- `LD_PRELOAD` 方式なので、静的リンクのバイナリや、`LD_PRELOAD` を意図的に外した
+  プロセスは捕捉できません。悪意ある回避には強くありません。
+- **改ざん耐性のある本物の syscall 監査が必要なら**、コンテナ内ではなく**ホスト側**で
+  `auditd` / `Falco` を当該コンテナの cgroup / PID namespace に絞って回してください。
+  これがこの種の監査の本来の置き場所です。

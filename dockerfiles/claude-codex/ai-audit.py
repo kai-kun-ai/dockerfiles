@@ -4,22 +4,27 @@
 
 WHY THIS EXISTS (issue #280: "add an audit feature to the codex/claude images")
 -------------------------------------------------------------------------------
-The original idea was to run ``auditd`` aggressively inside the image and emit a
-graphical report.  Running ``auditd`` *inside an (unprivileged) container* is not
-a mature path, though: the Linux kernel audit subsystem is **not namespaced**, so
-a containerised ``auditd`` needs ``CAP_AUDIT_CONTROL`` / ``CAP_AUDIT_READ`` and a
-host-shared netlink socket -- it either fails outright or pulls in host-wide
-events, which is neither portable nor safe for the ``make target=claude`` /
-``make target=codex`` workflow.
+Goal: record, at the OS level, the work that was actually done inside the image,
+and render it in a graphically understandable report.
 
-Instead we mine an audit trail that **already exists** and needs no privileges:
-Codex and Claude Code both persist a complete, structured, host-mounted record of
-every command the agent ran (and every file it touched) as line-delimited JSON:
+True kernel syscall auditing (``auditd`` / eBPF / process accounting) is *not*
+available inside an unprivileged container: those subsystems are **not
+namespaced** and need ``CAP_AUDIT_CONTROL`` / ``CAP_BPF`` / ``CAP_SYS_PACCT`` (or
+``--privileged``), which the ``make target=claude`` / ``make target=codex``
+sandbox deliberately does not grant. So we capture at the next level down --
+every ``execve`` -- with **snoopy**, a ~20-year-old LD_PRELOAD command logger
+enabled image-wide via ``/etc/ld.so.preload``. It needs no privileges, records
+the command actually run (argv, cwd, user, time) independently of the agent, and
+is the mature in-container answer to "what commands were executed".
 
-    Codex       : ~/.codex/sessions/**/*.jsonl   (already mined by ``codex-monitor``)
-    Claude Code : ~/.claude/projects/**/*.jsonl
+This tool reads two complementary sources and unifies them:
 
-This tool reads those logs and renders:
+    exec (snoopy) : /var/log/ai-audit/exec.log  -- OS-level, agent-independent
+    Codex         : ~/.codex/sessions/**/*.jsonl (also mined by ``codex-monitor``)
+    Claude Code   : ~/.claude/projects/**/*.jsonl
+
+The session logs add structure the exec stream lacks (which agent, file edits,
+per-session grouping); snoopy adds the independent ground truth. It renders:
 
   * a concise **text summary** on the terminal, and
   * a self-contained, dependency-free **HTML report** ("graphically
@@ -315,12 +320,62 @@ def parse_claude_file(path):
 
 
 # ---------------------------------------------------------------------------
+# OS-level exec auditing  (snoopy log)
+# ---------------------------------------------------------------------------
+#
+# snoopy (an LD_PRELOAD execve logger enabled image-wide via /etc/ld.so.preload)
+# records every command actually executed inside the container -- independently
+# of what the agents choose to write to their own logs. We configure it (see
+# dockerfiles/claude-codex/snoopy.ini) to emit one pipe-delimited line per exec:
+#
+#     snoopy-audit|<unix_ts>|<uid>|<username>|<cwd>|<cmdline>
+#
+# The cmdline is always last so it may safely contain '|' (split is bounded).
+EXEC_MARKER = "snoopy-audit|"
+
+
+def parse_exec_file(path):
+    session_default = "exec"
+    try:
+        handle = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for raw in handle:
+            if not raw.startswith(EXEC_MARKER):
+                continue
+            # marker | ts | uid | username | cwd | cmdline(may contain '|')
+            parts = raw.rstrip("\n").split("|", 5)
+            if len(parts) < 6:
+                continue
+            _marker, ts_s, _uid, username, cwd, cmdline = parts
+            cmdline = cmdline.strip()
+            if not cmdline:
+                continue
+            yield Event(parse_ts(ts_s), "exec", username or session_default,
+                        KIND_COMMAND, cmdline, program_name(cmdline), cwd)
+
+
+def resolve_exec_log(explicit):
+    """Pick the snoopy exec log: explicit path, else first that exists."""
+    if explicit:
+        return explicit
+    home = os.path.expanduser("~")
+    for candidate in ("/var/log/ai-audit/exec.log",
+                      os.path.join(home, ".ai-audit", "exec.log"),
+                      "/var/log/snoopy.log"):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Collection + summary
 # ---------------------------------------------------------------------------
 
 def collect_events(args):
     events = []
-    sources = {"codex": 0, "claude": 0}
+    sources = {"codex": 0, "claude": 0, "exec": 0}
 
     if args.agent in ("all", "codex"):
         for path in find_logs(args.codex_dir):
@@ -330,6 +385,11 @@ def collect_events(args):
         for path in find_logs(args.claude_dir):
             sources["claude"] += 1
             events.extend(parse_claude_file(path))
+    if args.agent in ("all", "exec"):
+        exec_log = resolve_exec_log(args.exec_log)
+        if exec_log and os.path.isfile(exec_log):
+            sources["exec"] += 1
+            events.extend(parse_exec_file(exec_log))
 
     cutoff = parse_since(args.since)
     if cutoff is not None:
@@ -386,8 +446,8 @@ def fmt_ts(dt):
 def render_text(summary, sources):
     out = []
     out.append("=== AI activity audit ===")
-    out.append("scanned : codex=%d claude=%d session file(s)"
-               % (sources["codex"], sources["claude"]))
+    out.append("scanned : codex=%d claude=%d session log(s), exec=%d snoopy log(s)"
+               % (sources["codex"], sources["claude"], sources["exec"]))
     out.append("window  : %s -> %s"
                % (fmt_ts(summary["first"]), fmt_ts(summary["last"])))
     out.append("sessions: %d   actions: %d"
@@ -459,7 +519,7 @@ td.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 .spark .b{flex:1;min-width:2px;background:linear-gradient(180deg,#6ad0ff,#4f8cff);border-radius:2px 2px 0 0}
 .pill{display:inline-block;padding:.05rem .5rem;border-radius:999px;font-size:.78rem;
   border:1px solid #2a2f3a;background:#171a22}
-.agent-codex{color:#ffcf66}.agent-claude{color:#c08cff}
+.agent-codex{color:#ffcf66}.agent-claude{color:#c08cff}.agent-exec{color:#6ad08a}
 footer{margin-top:2.5rem;color:#6b7280;font-size:.8rem}
 """
 
@@ -494,7 +554,8 @@ def _spark(hours):
 
 
 def _agent_class(agent):
-    return "agent-codex" if agent == "codex" else "agent-claude"
+    return {"codex": "agent-codex", "claude": "agent-claude",
+            "exec": "agent-exec"}.get(agent, "agent-claude")
 
 
 def render_html(summary, events, sources, generated_at, max_rows=500):
@@ -552,8 +613,8 @@ def render_html(summary, events, sources, generated_at, max_rows=500):
 <title>AI activity audit</title>
 <style>{style}</style></head><body>
 <h1>AI activity audit</h1>
-<p class="muted">generated {gen} &middot; sources: codex={sc} / claude={cl} session file(s)
-&middot; window {first} &rarr; {last}</p>
+<p class="muted">generated {gen} &middot; sources: codex={sc} / claude={cl} session log(s),
+exec={ex} snoopy log(s) &middot; window {first} &rarr; {last}</p>
 <div class="cards">{cards}</div>
 
 <h2>By agent</h2>
@@ -582,7 +643,7 @@ no telemetry, fully offline</footer>
 </body></html>
 """.format(
         style=HTML_STYLE, gen=html.escape(generated_at),
-        sc=sources["codex"], cl=sources["claude"],
+        sc=sources["codex"], cl=sources["claude"], ex=sources["exec"],
         first=fmt_ts(summary["first"]), last=fmt_ts(summary["last"]),
         cards=card_html, agents=agent_pills,
         bars=_bar_rows(summary["programs"]),
@@ -622,8 +683,10 @@ def build_parser():
                     "the agents' own session logs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--agent", choices=("all", "codex", "claude"),
-                        default="all", help="which agent's logs to include")
+    parser.add_argument("--agent", choices=("all", "codex", "claude", "exec"),
+                        default="all",
+                        help="which source to include: codex/claude session logs, "
+                             "exec (snoopy OS-level command log), or all")
     parser.add_argument("--since", default=None, metavar="DURATION",
                         help="only events newer than e.g. 30m, 24h, 7d, 2w")
     parser.add_argument("--top", type=int, default=15, metavar="N",
@@ -639,6 +702,9 @@ def build_parser():
                         help="Codex sessions directory")
     parser.add_argument("--claude-dir", default=os.path.join(home, ".claude", "projects"),
                         help="Claude Code projects directory")
+    parser.add_argument("--exec-log", default=None, metavar="PATH",
+                        help="snoopy exec-audit log (default: "
+                             "/var/log/ai-audit/exec.log)")
     return parser
 
 
