@@ -74,7 +74,7 @@ COPY --from=go_builder /usr/local/go /usr/local/go
 ADD ./exec_user.sh /usr/local/bin/exec_user.sh
 ADD ./setup_skills.sh /usr/local/bin/setup_skills.sh
 ADD ./ai-audit.py /usr/local/bin/ai-audit
-ADD ./snoopy.ini /etc/snoopy.ini
+ADD ./snoopy.ini /usr/local/src/snoopy.ini
 RUN chmod +x /usr/local/bin/exec_user.sh /usr/local/bin/setup_skills.sh /usr/local/bin/ai-audit
 
 # OS-level exec auditing (issue #280): record every execve via snoopy, a mature
@@ -87,9 +87,12 @@ RUN chmod +x /usr/local/bin/exec_user.sh /usr/local/bin/setup_skills.sh /usr/loc
 # parser end-to-end and fails the build if any break -- important because CI
 # builds this image but does not run it (the run-smoke step is skipped for
 # claude-codex), so a runtime-only regression would otherwise pass unnoticed.
+# snoopy ships /etc/snoopy.ini as a dpkg conffile, so install the package first
+# (clean /etc, no interactive conffile prompt) and only then drop in our config.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends snoopy && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    cp /usr/local/src/snoopy.ini /etc/snoopy.ini && \
     mkdir -p /var/log/ai-audit && chmod 1777 /var/log/ai-audit && \
     snoopy_lib="$(dpkg -L snoopy | grep -E '/libsnoopy\.so$' | head -n1)" && \
     test -n "${snoopy_lib}" && echo "${snoopy_lib}" > /etc/ld.so.preload && \
