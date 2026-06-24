@@ -96,7 +96,7 @@ RUN apt-get update && \
     mkdir -p /var/log/ai-audit && chmod 1777 /var/log/ai-audit && \
     snoopy_lib="$(dpkg -L snoopy | grep -E '/libsnoopy\.so$' | head -n1)" && \
     test -n "${snoopy_lib}" && echo "${snoopy_lib}" > /etc/ld.so.preload && \
-    /bin/echo snoopy-selftest-marker >/dev/null && \
+    sh -c '/bin/echo snoopy-selftest-marker' >/dev/null && \
     grep -q '^snoopy-audit|' /var/log/ai-audit/exec.log && \
     grep -q 'snoopy-selftest-marker' /var/log/ai-audit/exec.log && \
     python3 /usr/local/bin/ai-audit --agent exec \
