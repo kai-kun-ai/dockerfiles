@@ -235,6 +235,9 @@ mkdir -p -- "$$LOCAL_CODEX_DIR"; \
 DOCKER_MOUNTS+=("-v" "$$LOCAL_CODEX_DIR:$$CONTAINER_HOME/.codex:rw"); \
 DOCKER_MOUNTS+=("-v" "$$LOCAL_CLAUDE_DIR:$$CONTAINER_HOME/.claude:rw"); \
 DOCKER_MOUNTS+=("-v" "$$LOCAL_CLAUDE_JSON:$$CONTAINER_HOME/.claude.json:rw"); \
+AI_AUDIT_DIR="$$LOCAL_HOME/.shared_cache.ai-audit"; \
+mkdir -p -- "$$AI_AUDIT_DIR"; \
+DOCKER_MOUNTS+=("-v" "$$AI_AUDIT_DIR:/var/log/ai-audit:rw"); \
 if [ -d "$$CODEX_CSTM_DIR" ]; then \
   DOCKER_MOUNTS+=("-v" "$$CODEX_CSTM_DIR:$$CONTAINER_HOME/.codex-cstm:ro"); \
 fi; \
