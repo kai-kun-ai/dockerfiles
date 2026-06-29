@@ -27,6 +27,13 @@ function update_startup_tools() {
 		SKILLS_BOOTSTRAP="${SKILLS_BOOTSTRAP:-}" \
 		SKILLS_REFRESH="${SKILLS_REFRESH:-}" \
 		bash /usr/local/bin/setup_skills.sh || true
+
+	echo "Setting up everything-claude-code (ECC)..."
+	sudo -iu "${LOCAL_WHOAMI}" env \
+		HOME="/home/${LOCAL_WHOAMI}" \
+		ECC_BOOTSTRAP="${ECC_BOOTSTRAP:-}" \
+		ECC_REFRESH="${ECC_REFRESH:-}" \
+		bash /usr/local/bin/setup_ecc.sh || true
 }
 
 function exec_usershell() {

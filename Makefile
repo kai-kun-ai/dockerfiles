@@ -305,6 +305,8 @@ DOCKER_ENVS=( \
   "-e" "WORK_DIR=$$WORK_DIR" \
   "-e" "SKILLS_BOOTSTRAP=$${SKILLS_BOOTSTRAP:-}" \
   "-e" "SKILLS_REFRESH=$${SKILLS_REFRESH:-}" \
+  "-e" "ECC_BOOTSTRAP=$${ECC_BOOTSTRAP:-}" \
+  "-e" "ECC_REFRESH=$${ECC_REFRESH:-}" \
 ); \
 if [ -n "$${SSH_AUTH_SOCK:-}" ]; then \
   if [ "$$(uname -s)" = "Darwin" ]; then \
